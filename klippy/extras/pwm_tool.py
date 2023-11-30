@@ -27,9 +27,12 @@ class MCU_queued_pwm:
         self._pin = pin_params['pin']
         self._invert = pin_params['invert']
         self._start_value = self._shutdown_value = float(self._invert)
-        self._last_clock = self._cycle_ticks = 0
+        self._last_clock = self._last_value = self._default_value = 0
+        self._cycle_ticks = self._duration_ticks = 0
         self._pwm_max = 0.
         self._set_cmd_tag = None
+        self._wakeup_timer = None
+        self._need_kick_wakeup = False
     def get_mcu(self):
         return self._mcu
     def setup_max_duration(self, max_duration):
@@ -52,17 +55,23 @@ class MCU_queued_pwm:
         printtime = self._mcu.estimated_print_time(curtime)
         self._last_clock = self._mcu.print_time_to_clock(printtime + 0.200)
         cycle_ticks = self._mcu.seconds_to_clock(self._cycle_time)
-        mdur_ticks = self._mcu.seconds_to_clock(self._max_duration)
-        if mdur_ticks >= 1<<31:
+        self._duration_ticks = self._mcu.seconds_to_clock(self._max_duration)
+        if self._duration_ticks >= 1<<31:
             raise pins.error("PWM pin max duration too large")
+        if self._duration_ticks:
+            self._mcu.register_flush_callback(self._flush_notification)
+            reactor = self._mcu.get_printer().get_reactor()
+            self._wakeup_timer = reactor.register_timer(self._wakeup_handler)
+            self._need_kick_wakeup = True
         if self._hardware_pwm:
             self._pwm_max = self._mcu.get_constant_float("PWM_MAX")
+            self._default_value = self._shutdown_value * self._pwm_max
             self._mcu.add_config_cmd(
                 "config_pwm_out oid=%d pin=%s cycle_ticks=%d value=%d"
                 " default_value=%d max_duration=%d"
                 % (self._oid, self._pin, cycle_ticks,
                    self._start_value * self._pwm_max,
-                   self._shutdown_value * self._pwm_max, mdur_ticks))
+                   self._default_value, self._duration_ticks))
             svalue = int(self._start_value * self._pwm_max + 0.5)
             self._mcu.add_config_cmd("queue_pwm_out oid=%d clock=%d value=%d"
                                      % (self._oid, self._last_clock, svalue),
@@ -80,7 +89,8 @@ class MCU_queued_pwm:
             "config_digital_out oid=%d pin=%s value=%d"
             " default_value=%d max_duration=%d"
             % (self._oid, self._pin, self._start_value >= 1.0,
-               self._shutdown_value >= 0.5, mdur_ticks))
+               self._shutdown_value >= 0.5, self._duration_ticks))
+        self._default_value = int(self._shutdown_value >= 0.5) * cycle_ticks
         self._mcu.add_config_cmd(
             "set_digital_out_pwm_cycle oid=%d cycle_ticks=%d"
             % (self._oid, cycle_ticks))
@@ -92,21 +102,46 @@ class MCU_queued_pwm:
         self._set_cmd_tag = self._mcu.lookup_command(
             "queue_digital_out oid=%c clock=%u on_ticks=%u",
             cq=cmd_queue).get_command_tag()
+    def _send_update(self, clock, val):
+        self._last_clock = clock = max(self._last_clock, clock)
+        self._last_value = val
+        data = (self._set_cmd_tag, self._oid, clock & 0xffffffff, val)
+        ret = self._stepcompress_queue_mq_msg(self._stepqueue, clock,
+                                              data, len(data))
+        if ret:
+            raise error("Internal error in stepcompress")
+        if self._last_value != self._default_value and self._need_kick_wakeup:
+            self._need_kick_wakeup = False
+            reactor = self._mcu.get_printer().get_reactor()
+            reactor.update_timer(self._wakeup_timer, reactor.NOW)
     def set_pwm(self, print_time, value):
         clock = self._mcu.print_time_to_clock(print_time)
-        minclock = self._last_clock
-        self._last_clock = clock
         if self._invert:
             value = 1. - value
         max_count = self._cycle_ticks
         if self._hardware_pwm:
             max_count = self._pwm_max
         v = int(max(0., min(1., value)) * max_count + 0.5)
-        data = (self._set_cmd_tag, self._oid, clock & 0xffffffff, v)
-        ret = self._stepcompress_queue_mq_msg(self._stepqueue, clock,
-                                              data, len(data))
-        if ret:
-            raise error("Internal error in stepcompress")
+        self._send_update(clock, v)
+    def _flush_notification(self, print_time, clock):
+        if self._last_value != self._default_value:
+            while clock >= self._last_clock + self._duration_ticks:
+                self._send_update(self._last_clock + self._duration_ticks,
+                                  self._last_value)
+    def _wakeup_handler(self, eventtime):
+        if self._last_value == self._default_value:
+            self._need_kick_wakeup = True
+            return self._mcu.get_printer().get_reactor().NEVER
+        exp_clock = self._last_clock + self._duration_ticks
+        exp_time = self._mcu.clock_to_print_time(exp_clock)
+        est_print_time = self._mcu.estimated_print_time(eventtime)
+        avail_time = exp_time - est_print_time - PIN_MIN_TIME
+        if avail_time > 0.:
+            return eventtime + avail_time
+        # Wake up toolhead flushing (so that _flush_notification() is invoked)
+        toolhead = self._mcu.get_printer().lookup_object("toolhead")
+        toolhead.note_kinematic_activity(exp_time + PIN_MIN_TIME)
+        return eventtime + avail_time + self._max_duration
 
 class PrinterOutputPin:
     def __init__(self, config):
@@ -121,7 +156,11 @@ class PrinterOutputPin:
         self.mcu_pin.setup_cycle_time(cycle_time, hardware_pwm)
         self.scale = config.getfloat('scale', 1., above=0.)
         self.last_print_time = 0.
-        self.mcu_pin.setup_max_duration(0.)
+        # Support mcu checking for maximum duration
+        max_mcu_duration = config.getfloat('maximum_mcu_duration', 0.,
+                                           minval=0.500,
+                                           maxval=MAX_SCHEDULE_TIME)
+        self.mcu_pin.setup_max_duration(max_mcu_duration)
         # Determine start and shutdown values
         self.last_value = config.getfloat(
             'value', 0., minval=0., maxval=self.scale) / self.scale
